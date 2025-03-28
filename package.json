@@ -23,6 +23,14 @@
       {
         "command": "vscode-android-emulator-sidepanel.openEmulator",
         "title": "Open Android Emulator"
+      },
+      {
+        "command": "vscode-android-emulator-sidepanel.openSettings",
+        "title": "Open Android Emulator Settings"
+      },
+      {
+        "command": "vscode-android-emulator-sidepanel.openLogs",
+        "title": "Show Android Emulator Extension Logs"
       }
     ],
     "viewsContainers": {
@@ -43,6 +51,26 @@
           "icon": "media/android.svg"
         }
       ]
+    },
+    "configuration": {
+      "title": "Android Emulator",
+      "properties": {
+        "vscode-android-emulator-sidepanel.sdkPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Android SDK directory. Leave empty to use the PATH environment variable."
+        },
+        "vscode-android-emulator-sidepanel.emulatorPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Android emulator executable. Leave empty to auto-detect."
+        },
+        "vscode-android-emulator-sidepanel.adbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to ADB executable. Leave empty to auto-detect."
+        }
+      }
     }
   },
   "scripts": {
