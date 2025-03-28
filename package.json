@@ -1,7 +1,7 @@
 {
-  "name": "VSCode-Android-Emulator-SidePanel",
-  "displayName": "VSCode-Android-Emulator-SidePanel",
-  "description": "Android emulator in VS Code side panel",
+  "name": "vscode-android-emulator-sidepanel",
+  "displayName": "Android Emulator Side Panel",
+  "description": "Launch and manage Android emulators directly from VS Code side panel",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.98.0"
@@ -9,12 +9,19 @@
   "categories": [
     "Other"
   ],
+  "keywords": [
+    "android",
+    "emulator",
+    "avd",
+    "mobile",
+    "development"
+  ],
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "VSCode-Android-Emulator-SidePanel.openEmulator",
+        "command": "vscode-android-emulator-sidepanel.openEmulator",
         "title": "Open Android Emulator"
       }
     ],
@@ -30,8 +37,10 @@
     "views": {
       "android-emulator": [
         {
+          "type": "webview",
           "id": "androidEmulatorView",
-          "name": "Emulator Controls"
+          "name": "Android Emulator",
+          "icon": "media/android.svg"
         }
       ]
     }
