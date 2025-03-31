@@ -494,28 +494,60 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
         return { avds: [], error: "No Android virtual devices found. Create some using Android Studio." };
       }
 
-      // Convert to AvdInfo objects
+      // Convert to AvdInfo objects - all initially set to stopped
       const avds = avdList.map(name => ({ name, status: 'stopped' as 'stopped' | 'running' }));
 
-      // Check running emulators
-      try {
-        log(`Executing: ${paths.adb} devices`);
-        const { stdout: runningOutput } = await exec(`"${paths.adb}" devices`);
-        log(`adb devices output: ${runningOutput}`);
+      log(`Found ${avds.length} AVDs: ${avdList.join(', ')}`);
+      
+      // Get running emulators with increased timeout for reliability
+      log('Getting running emulator information...');
+      const runningEmulatorMap = await this._getRunningEmulators(paths.adb);
+      
+      // Debug information to help diagnose name matching issues
+      log('=== DEBUGGING NAME MATCHING ===');
+      log(`Available AVDs: ${avds.map(avd => `"${avd.name}"`).join(', ')}`);
+      log(`Running AVD map keys: ${Array.from(runningEmulatorMap.keys()).map(name => `"${name}"`).join(', ')}`);
+      
+      // Create a normalized map for case-insensitive lookup
+      const normalizedRunningMap = new Map<string, string>();
+      for (const [avdName, emulatorId] of runningEmulatorMap.entries()) {
+        normalizedRunningMap.set(this._normalizeAvdName(avdName), emulatorId);
+        log(`Normalized running AVD: "${avdName}" -> "${this._normalizeAvdName(avdName)}"`);
+      }
+      
+      // Mark AVDs as running if they are found in the running map
+      for (const avd of avds) {
+        const normalizedName = this._normalizeAvdName(avd.name);
+        log(`Checking if "${avd.name}" (normalized: "${normalizedName}") is running...`);
         
-        const runningLines = runningOutput.split('\n');
-        
-        // Mark AVDs as running if they appear in adb devices output
-        for (const avd of avds) {
-          if (runningLines.some(line => line.includes('emulator') && line.includes('device'))) {
-            avd.status = 'running';
-            log(`Detected running AVD: ${avd.name}`);
+        if (normalizedRunningMap.has(normalizedName)) {
+          avd.status = 'running';
+          const emulatorId = normalizedRunningMap.get(normalizedName);
+          log(`✓ Marked AVD ${avd.name} as running (emulator ID: ${emulatorId})`);
+        } else if (runningEmulatorMap.has(avd.name)) {
+          // Direct match without normalization as fallback
+          avd.status = 'running';
+          const emulatorId = runningEmulatorMap.get(avd.name);
+          log(`✓ Marked AVD ${avd.name} as running (direct match, emulator ID: ${emulatorId})`);
+        } else {
+          // Additional check - look for a partial match in case of truncated names
+          let found = false;
+          for (const [runningName, emulatorId] of runningEmulatorMap.entries()) {
+            if (runningName.includes(avd.name) || avd.name.includes(runningName)) {
+              avd.status = 'running';
+              log(`✓ Marked AVD ${avd.name} as running (partial match with "${runningName}", emulator ID: ${emulatorId})`);
+              found = true;
+              break;
+            }
+          }
+          
+          if (!found) {
+            log(`AVD ${avd.name} is not running`);
           }
         }
-      } catch (e) {
-        log(`Error checking running devices: ${e}`);
       }
-
+      log('=== END DEBUGGING ===');
+      
       return { avds };
     } catch (error: any) {
       const errorMsg = error?.message || String(error);
@@ -532,6 +564,198 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // Helper method to normalize AVD names for consistent comparison
+  private _normalizeAvdName(name: string): string {
+    // Trim whitespace, convert to lowercase, and remove special characters
+    return name.trim().toLowerCase()
+      .replace(/[\s_-]+/g, '') // Remove spaces, underscores, hyphens
+      .replace(/[^\w\d]/g, ''); // Remove non-alphanumeric characters
+  }
+
+  private async _getRunningEmulators(adbPath: string): Promise<Map<string, string>> {
+    const runningMap = new Map<string, string>();
+    
+    try {
+      log(`Executing: ${adbPath} devices`);
+      const { stdout: devicesOutput } = await exec(`"${adbPath}" devices`);
+      log(`adb devices output: ${devicesOutput}`);
+      
+      // Extract running emulator IDs
+      const runningEmulators: string[] = [];
+      const deviceLines = devicesOutput.split('\n');
+      
+      for (const line of deviceLines) {
+        const match = line.match(/^(emulator-\d+)\s+device/);
+        if (match) {
+          const emulatorId = match[1];
+          runningEmulators.push(emulatorId);
+          log(`Found running emulator: ${emulatorId}`);
+        }
+      }
+      
+      if (runningEmulators.length === 0) {
+        log('No running emulators found');
+        return runningMap;
+      }
+      
+      // For each running emulator, try multiple approaches to identify its AVD name
+      for (const emulatorId of runningEmulators) {
+        const port = emulatorId.split('-')[1]; // Extract port from emulator-XXXX
+
+        try {
+          // Approach 1: Use 'emu avd name' command - most reliable when it works
+          try {
+            log(`Trying adb -s ${emulatorId} emu avd name`);
+            const { stdout } = await exec(`"${adbPath}" -s ${emulatorId} emu avd name`);
+            if (stdout && stdout.trim()) {
+              const avdName = stdout.trim();
+              runningMap.set(avdName, emulatorId);
+              log(`✅ Found AVD name via 'emu avd name': ${avdName} (${emulatorId})`);
+              continue; // Success - move to next emulator
+            }
+          } catch (err) {
+            log(`'emu avd name' failed: ${err}`);
+          }
+
+          // Approach 2: Use getprop - works well on newer emulators
+          try {
+            log(`Trying adb -s ${emulatorId} shell getprop ro.kernel.qemu.avd_name`);
+            const { stdout } = await exec(`"${adbPath}" -s ${emulatorId} shell getprop ro.kernel.qemu.avd_name`);
+            if (stdout && stdout.trim()) {
+              const avdName = stdout.trim();
+              runningMap.set(avdName, emulatorId);
+              log(`✅ Found AVD name via getprop: ${avdName} (${emulatorId})`);
+              continue; // Success - move to next emulator
+            }
+          } catch (err) {
+            log(`getprop approach failed: ${err}`);
+          }
+
+          // Approach 3: Look in the process list for the emulator command line (Windows)
+          if (os.platform() === 'win32') {
+            try {
+              log(`Trying to find emulator process info for port ${port}`);
+              const { stdout: tasklistOutput } = await exec('tasklist /FI "IMAGENAME eq emulator.exe" /V');
+              log(`Emulator processes: ${tasklistOutput.slice(0, 200)}...`);
+              
+              // Look for the emulator process corresponding to our port
+              const emulatorProcess = tasklistOutput
+                .split('\n')
+                .find(line => line.includes(`emulator-${port}`) || line.includes(`-avd`));
+              
+              if (emulatorProcess) {
+                // Extract the AVD name from the process command line
+                // Usually in format "... -avd AvdName ..."
+                const avdMatch = emulatorProcess.match(/-avd\s+(\S+)/);
+                if (avdMatch && avdMatch[1]) {
+                  const avdName = avdMatch[1].trim();
+                  runningMap.set(avdName, emulatorId);
+                  log(`✅ Found AVD name from process list: ${avdName} (${emulatorId})`);
+                  continue; // Success - move to next emulator
+                }
+              }
+            } catch (err) {
+              log(`Process search approach failed: ${err}`);
+            }
+          }
+          
+          // Approach 4: Check running processes (Unix-based systems)
+          if (os.platform() !== 'win32') {
+            try {
+              log('Checking running processes for emulator command lines');
+              const { stdout: psOutput } = await exec('ps aux | grep -v grep | grep emulator');
+              
+              // Look for emulator command lines with our port
+              const relevantProcesses = psOutput
+                .split('\n')
+                .filter(line => line.includes(`-port ${port}`) || line.includes(`emulator-${port}`));
+              
+              for (const process of relevantProcesses) {
+                const avdMatch = process.match(/-avd\s+(\S+)/);
+                if (avdMatch && avdMatch[1]) {
+                  const avdName = avdMatch[1].trim();
+                  runningMap.set(avdName, emulatorId);
+                  log(`✅ Found AVD name from ps output: ${avdName} (${emulatorId})`);
+                  break; // Found it - break the loop
+                }
+              }
+              
+              // If we found an AVD, move to next emulator
+              if ([...runningMap.keys()].some(name => runningMap.get(name) === emulatorId)) {
+                continue;
+              }
+            } catch (err) {
+              log(`Process search approach failed: ${err}`);
+            }
+          }
+          
+          // Last resort: Use the emulator console via telnet
+          // This is more complex and less reliable, but sometimes works
+          try {
+            // Skip on platforms without telnet
+            if (os.platform() === 'win32' || await this._commandExists('telnet')) {
+              log(`Trying telnet to emulator console on port ${port}`);
+              
+              let telnetCommand;
+              if (os.platform() === 'win32') {
+                // Windows requires a bit more care with telnet
+                telnetCommand = `echo avd name | telnet localhost ${port}`;
+              } else {
+                telnetCommand = `printf "avd name\\r\\nquit\\r\\n" | telnet localhost ${port}`;
+              }
+              
+              const { stdout: telnetOutput } = await exec(telnetCommand, { timeout: 3000 });
+              log(`Telnet output: ${telnetOutput}`);
+              
+              // Try to extract the AVD name from the telnet response
+              const nameMatches = telnetOutput.match(/avd name\s+['"]?([^'"]+?)['"]?(\s|$)/i) || 
+                                 telnetOutput.match(/OK\s+['"]?([^'"]+?)['"]?(\s|$)/i);
+                                 
+              if (nameMatches && nameMatches[1]) {
+                const avdName = nameMatches[1].trim();
+                if (avdName && avdName !== 'OK') {
+                  runningMap.set(avdName, emulatorId);
+                  log(`✅ Found AVD name via telnet: ${avdName} (${emulatorId})`);
+                  continue; // Success - move to next emulator
+                }
+              }
+            }
+          } catch (err) {
+            log(`Telnet approach failed: ${err}`);
+          }
+          
+          log(`⚠️ Could not determine AVD name for emulator ${emulatorId}`);
+        } catch (error) {
+          log(`Error identifying AVD for emulator ${emulatorId}: ${error}`);
+        }
+      }
+    } catch (e) {
+      log(`Error getting running emulators: ${e}`);
+    }
+    
+    // Final debug output of all found AVDs
+    log(`Found ${runningMap.size} running AVDs:`);
+    for (const [avdName, emulatorId] of runningMap.entries()) {
+      log(`- ${avdName} (${emulatorId})`);
+    }
+    
+    return runningMap;
+  }
+  
+  // Helper to check if a command exists on the system
+  private async _commandExists(command: string): Promise<boolean> {
+    try {
+      const checkCmd = os.platform() === 'win32' 
+        ? `where ${command}` 
+        : `which ${command}`;
+      
+      await exec(checkCmd);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   private async _launchAvd(avdName: string) {
     try {
       const { paths, error } = await this._findAndroidTools();
@@ -542,71 +766,125 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
       }
       
       const platform = os.platform();
-      let command = '';
       
       if (platform === 'win32') {
-        // For Windows, check if we need to run from the SDK directory
-        if (paths.emulator === 'emulator') {
-          // No path to emulator, likely not in PATH
-          const config = vscode.workspace.getConfiguration('vscode-android-emulator-sidepanel');
-          const sdkPath = config.get('sdkPath', '');
+        // Windows-specific launch method
+        const config = vscode.workspace.getConfiguration('vscode-android-emulator-sidepanel');
+        const sdkPath = expandEnvVars(config.get('sdkPath', ''));
+        
+        if (!sdkPath) {
+          vscode.window.showErrorMessage('Unable to launch emulator: Android SDK path not configured. Please use "Auto-Detect SDK" or configure the SDK path manually.');
+          return;
+        }
+
+        log(`Launching Windows emulator for AVD: ${avdName}`);
+
+        // Try direct execution first - this has highest chance of working
+        try {
+          // Use direct path to emulator.exe
+          const emulatorExe = path.join(sdkPath, 'emulator', 'emulator.exe');
           
-          if (sdkPath) {
-            // Run with full path
-            const expandedSdkPath = expandEnvVars(sdkPath);
-            const emulatorPath = path.join(expandedSdkPath, 'emulator', 'emulator.exe');
-            
-            if (await exists(emulatorPath)) {
-              command = `start cmd.exe /c "cd /d "${expandedSdkPath}\\emulator" && emulator.exe -avd ${avdName}"`;
-              log(`Using full SDK path to launch emulator: ${command}`);
+          log(`Executing emulator directly: "${emulatorExe}" -avd ${avdName}`);
+          
+          // Use exec to run the command and capture output
+          cp.exec(`"${emulatorExe}" -avd "${avdName}"`, {
+            windowsHide: false,  // Show the window
+          }, (error, stdout, stderr) => {
+            if (error) {
+              log(`Error launching emulator: ${error.message}`);
+              log(`Stderr: ${stderr}`);
+              
+              // Try fallback method
+              this._launchEmulatorFallback(sdkPath, avdName);
             } else {
-              // Try alternative path
-              const altEmulatorPath = path.join(expandedSdkPath, 'tools', 'emulator.exe');
-              if (await exists(altEmulatorPath)) {
-                command = `start cmd.exe /c "cd /d "${expandedSdkPath}\\tools" && emulator.exe -avd ${avdName}"`;
-                log(`Using alternative path to launch emulator: ${command}`);
-              } else {
-                // Just try using the raw command
-                command = `start cmd.exe /c "${expandedSdkPath}\\emulator\\emulator.exe" -avd ${avdName}`;
-                log(`Falling back to raw command: ${command}`);
-              }
+              log(`Emulator launch initiated: ${avdName}`);
+              log(`Stdout: ${stdout}`);
             }
-          } else {
-            // No SDK path, show a helpful error
-            const errorMsg = 'Unable to launch emulator: Android SDK path not configured';
-            log(errorMsg);
-            vscode.window.showErrorMessage(errorMsg + '. Please use "Auto-Detect SDK" or configure the SDK path manually.');
-            return;
-          }
-        } else {
-          // Windows - quote paths properly
-          command = `start cmd.exe /c "\\"${paths.emulator}\\" -avd ${avdName}"`;
+          });
+          
+          vscode.window.showInformationMessage(`Launching Android emulator: ${avdName}`);
+        } catch (execError) {
+          log(`Error in primary launch method: ${execError}`);
+          // Try fallback method
+          this._launchEmulatorFallback(sdkPath, avdName);
         }
       } else if (platform === 'darwin') {
         // macOS
         command = `osascript -e 'tell application "Terminal" to do script "\\"${paths.emulator}\\" -avd ${avdName}"'`;
+        
+        cp.exec(command, (error) => {
+          if (error) {
+            const errorMsg = `Failed to launch AVD: ${error.message}`;
+            log(errorMsg);
+            vscode.window.showErrorMessage(errorMsg);
+          } else {
+            const successMsg = `Launching Android emulator: ${avdName}`;
+            log(successMsg);
+            vscode.window.showInformationMessage(successMsg);
+          }
+        });
       } else {
         // Linux
         command = `x-terminal-emulator -e "\\"${paths.emulator}\\" -avd ${avdName}"`;
+        
+        cp.exec(command, (error) => {
+          if (error) {
+            const errorMsg = `Failed to launch AVD: ${error.message}`;
+            log(errorMsg);
+            vscode.window.showErrorMessage(errorMsg);
+          } else {
+            const successMsg = `Launching Android emulator: ${avdName}`;
+            log(successMsg);
+            vscode.window.showInformationMessage(successMsg);
+          }
+        });
       }
-
-      log(`Launching AVD with command: ${command}`);
       
-      cp.exec(command, (error) => {
-        if (error) {
-          const errorMsg = `Failed to launch AVD: ${error.message}`;
-          log(errorMsg);
-          vscode.window.showErrorMessage(errorMsg);
-        } else {
-          const successMsg = `Launching Android emulator: ${avdName}`;
-          log(successMsg);
-          vscode.window.showInformationMessage(successMsg);
-        }
-      });
     } catch (error: any) {
       const errorMsg = `Failed to launch Android emulator: ${error?.message || String(error)}`;
       log(errorMsg);
       vscode.window.showErrorMessage(errorMsg);
+    }
+  }
+  
+  // New helper method for fallback launch on Windows
+  private _launchEmulatorFallback(sdkPath: string, avdName: string) {
+    log(`Trying fallback launch method for AVD: ${avdName}`);
+    
+    try {
+      const emulatorDir = path.join(sdkPath, 'emulator');
+      
+      // Method 1: Using start command directly
+      const startCommand = `start cmd.exe /c "cd /d "${emulatorDir}" && emulator.exe -avd "${avdName}" -no-boot-anim"`;
+      log(`Executing fallback command: ${startCommand}`);
+      
+      cp.exec(startCommand, (error) => {
+        if (error) {
+          log(`Fallback method 1 failed: ${error.message}`);
+          
+          // Method 2: Using spawn with shell
+          try {
+            log('Trying fallback method 2: spawn with shell');
+            const process = cp.spawn('cmd.exe', ['/c', `cd /d "${emulatorDir}" && emulator.exe -avd "${avdName}"`], {
+              detached: true,
+              stdio: 'ignore',
+              shell: true,
+              windowsHide: false
+            });
+            
+            process.unref();
+            log('Fallback method 2 executed');
+          } catch (spawnError) {
+            log(`Fallback method 2 failed: ${spawnError}`);
+            vscode.window.showErrorMessage(`Failed to launch Android emulator: ${spawnError}`);
+          }
+        } else {
+          log('Fallback method 1 succeeded');
+        }
+      });
+    } catch (error) {
+      log(`All fallback methods failed: ${error}`);
+      vscode.window.showErrorMessage(`Failed to launch Android emulator after trying all methods: ${error}`);
     }
   }
 
@@ -703,6 +981,38 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
             border: 1px solid rgba(76, 175, 80, 0.5);
             border-radius: 2px;
           }
+          .troubleshoot-link {
+            margin-top: 15px;
+            font-size: 0.9em;
+          }
+          
+          .troubleshoot-link a {
+            color: var(--vscode-textLink-foreground);
+            text-decoration: none;
+            cursor: pointer;
+          }
+          
+          .troubleshoot-link a:hover {
+            text-decoration: underline;
+          }
+          
+          .button-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+          }
+          .auto-refresh {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            gap: 5px;
+          }
+          .auto-refresh input {
+            margin: 0;
+          }
+          .auto-refresh label {
+            font-size: 0.9em;
+          }
         </style>
     </head>
     <body>
@@ -718,10 +1028,20 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
               </div>
             </div>
             
+            <div class="auto-refresh">
+              <input type="checkbox" id="auto-refresh-check" checked>
+              <label for="auto-refresh-check">Auto-refresh (every 5 seconds)</label>
+            </div>
+            
             <div id="message-container"></div>
             <div id="error-container"></div>
             <p id="loading-text" class="loading">Loading available AVDs...</p>
             <div id="avd-list"></div>
+            
+            <div class="troubleshoot-link">
+              <a id="open-emulator-location">Open Emulator Directory</a> | 
+              <a href="https://developer.android.com/studio/run/emulator-troubleshooting" target="_blank">Android Emulator Troubleshooting</a>
+            </div>
         </div>
         <script>
             (function() {
@@ -734,6 +1054,27 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
                 const logsBtn = document.getElementById('logs-btn');
                 const errorContainer = document.getElementById('error-container');
                 const messageContainer = document.getElementById('message-container');
+                const openEmulatorLocationLink = document.getElementById('open-emulator-location');
+                const autoRefreshCheck = document.getElementById('auto-refresh-check');
+                
+                let refreshInterval = null;
+                
+                // Enable or disable auto-refresh
+                function toggleAutoRefresh() {
+                    clearInterval(refreshInterval);
+                    
+                    if (autoRefreshCheck.checked) {
+                        refreshInterval = setInterval(() => {
+                            vscode.postMessage({ command: 'refresh' });
+                        }, 3000); // More frequent refresh for better responsiveness
+                    }
+                }
+                
+                // Set up auto-refresh on load
+                toggleAutoRefresh();
+                
+                // Listen for auto-refresh checkbox changes
+                autoRefreshCheck.addEventListener('change', toggleAutoRefresh);
                 
                 // Request AVD list on load
                 vscode.postMessage({ command: 'getAvds' });
@@ -762,6 +1103,11 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
                 // Handle logs button
                 logsBtn.addEventListener('click', () => {
                     vscode.postMessage({ command: 'openLogs' });
+                });
+                
+                // Add event listener for the "Open Emulator Directory" link
+                openEmulatorLocationLink.addEventListener('click', () => {
+                    vscode.postMessage({ command: 'openEmulatorLocation' });
                 });
                 
                 // Listen for messages from extension
@@ -834,6 +1180,14 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
                             <li>Linux: ~/Android/Sdk</li>
                         </ul>
                         <p>If you're still having issues, click "View Logs" to see detailed diagnostic information.</p>
+                        <h4>Troubleshooting Emulator Launch Issues</h4>
+                        <p>If the emulator window appears and immediately closes:</p>
+                        <ul>
+                            <li>Make sure you have Intel HAXM or equivalent virtualization technology installed</li>
+                            <li>Check that Hyper-V is enabled (or disabled) according to your emulator requirements</li>
+                            <li>Try running the emulator directly from the command line</li>
+                            <li>Check the logs for specific error messages</li>
+                        </ul>
                     \`;
                     
                     avdListContainer.appendChild(setupGuide);
@@ -866,6 +1220,9 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
                         nameContainer.appendChild(statusEl);
                         avdItem.appendChild(nameContainer);
                         
+                        const buttonContainer = document.createElement('div');
+                        buttonContainer.className = 'button-row';
+                        
                         const launchBtn = document.createElement('button');
                         launchBtn.className = 'button';
                         launchBtn.textContent = avd.status === 'running' ? 'Already Running' : 'Launch';
@@ -883,11 +1240,17 @@ class AndroidEmulatorViewProvider implements vscode.WebviewViewProvider {
                                 // Give it some time and then refresh list
                                 setTimeout(() => {
                                     vscode.postMessage({ command: 'refresh' });
-                                }, 5000);
+                                }, 3000); // Reduced to 3 seconds for faster feedback
+                                
+                                // Add a second refresh after a bit longer
+                                setTimeout(() => {
+                                    vscode.postMessage({ command: 'refresh' });
+                                }, 10000); // Another refresh after 10 seconds
                             });
                         }
                         
-                        avdItem.appendChild(launchBtn);
+                        buttonContainer.appendChild(launchBtn);
+                        avdItem.appendChild(buttonContainer);
                         avdListContainer.appendChild(avdItem);
                     });
                 }
